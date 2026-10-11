@@ -79,53 +79,55 @@ class HotkeyThread(threading.Thread):
 # Frame processing
 # --------------------------------------------------------------------------
 def key_out_blue(frame):
-    import numpy as np
+    """Turn the blue background transparent with a feathered edge."""
+    from PIL import ImageChops
     frame = frame.convert("RGBA")
-    arr = np.asarray(frame.convert("RGB")).astype(int)
-    dist = (((arr - np.array(BG_COLOR)) ** 2).sum(axis=2)) ** 0.5
-    alpha = np.ones(dist.shape, dtype=float) * 255.0
-    alpha[dist < INNER_TOL] = 0
-    feather = (dist >= INNER_TOL) & (dist < OUTER_TOL)
-    alpha[feather] = (dist[feather] - INNER_TOL) / (OUTER_TOL - INNER_TOL) * 255.0
-    frame.putalpha(Image.fromarray(alpha.astype("uint8"), mode="L"))
+    bg = Image.new("RGB", frame.size, BG_COLOR)
+    # per-channel difference -> brightness = colour distance proxy
+    dist = ImageChops.difference(frame.convert("RGB"), bg).convert("L")
+    lut = ([0] * 16
+           + [int((i - 16) / (48 - 16) * 255) for i in range(16, 48)]
+           + [255] * (256 - 48))
+    frame.putalpha(dist.point(lut))
     return frame
 
 
 def register_frames(frames):
     """Shift frames so the HEAD stays locked (only the tail wiggles)."""
-    import numpy as np
-    masks = [(np.asarray(f)[:, :, 3] > 128) for f in frames]
-    H, W = masks[0].shape
-    y0 = int(H * 0.55)
+    from PIL import ImageChops
+    W, H = frames[0].size
+    y0 = int(H * 0.55)  # head region: bottom 45%
 
-    def centroid(m):
-        sub = m[y0:, :]
-        ys, xs = np.where(sub)
-        if len(xs) == 0:
+    def centroid(f):
+        a = f.crop((0, y0, W, H)).split()[3]
+        rw, rh = W, H - y0
+        total = sx = sy = 0
+        for i, v in enumerate(a.getdata()):
+            if v > 128:
+                total += 1
+                sx += i % rw
+                sy += i // rw
+        if total == 0:
             return (W / 2, (H + y0) / 2)
-        return (xs.mean(), ys.mean() + y0)
+        return (sx / total, sy / total + y0)
 
-    ref_cx, ref_cy = centroid(masks[0])
-    shifted, shifted_masks = [], []
-    for f, m in zip(frames, masks):
-        cx, cy = centroid(m)
+    ref_cx, ref_cy = centroid(frames[0])
+    shifted, union = [], None
+    for f in frames:
+        cx, cy = centroid(f)
         dx, dy = int(round(ref_cx - cx)), int(round(ref_cy - cy))
         canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         canvas.paste(f, (dx, dy), f)
         shifted.append(canvas)
-        mcanvas = np.zeros_like(m)
-        sy0, sy1 = max(0, dy), min(H, H + dy)
-        sx0, sx1 = max(0, dx), min(W, W + dx)
-        my0, my1 = max(0, -dy), min(H, H - dy)
-        mx0, mx1 = max(0, -dx), min(W, W - dx)
-        mcanvas[sy0:sy1, sx0:sx1] = m[my0:my1, mx0:mx1]
-        shifted_masks.append(mcanvas)
+        m = Image.new("L", (W, H), 0)
+        m.paste(f.split()[3].point(lambda a: 255 if a > 128 else 0),
+                (dx, dy))
+        union = m if union is None else ImageChops.lighter(union, m)
 
-    union = np.stack(shifted_masks).any(axis=0)
-    ys, xs = np.where(union)
+    bx0, by0, bx1, by1 = union.getbbox()
     pad = 6
-    x0, yt = max(0, xs.min() - pad), max(0, ys.min() - pad)
-    x1, y1 = min(W, xs.max() + pad), min(H, ys.max() + pad)
+    x0, yt = max(0, bx0 - pad), max(0, by0 - pad)
+    x1, y1 = min(W, bx1 + pad), min(H, by1 + pad)
     return [f.crop((x0, yt, x1, y1)) for f in shifted]
 
 
