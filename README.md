@@ -23,9 +23,11 @@ leaves a faint ripple behind its tail, and can chase your mouse cursor.
 | `Ctrl`+`Shift`+`F` | Toggle follow-my-mouse mode (press again to go back to wandering) |
 | Right-click the fish | Menu: size presets, swim speed, ripples on/off, follow mode, quit |
 | `Space` | Pause / resume |
-| `Q` | Quit |
+| `Q` or `Ctrl`+`Shift`+`Q` | Quit (`Ctrl`+`Shift`+`Q` works from anywhere) |
 
-To stop it, right-click the fish and pick **Quit**.
+To stop it, right-click the fish and pick **Quit** (or press `Ctrl`+`Shift`+`Q`).
+
+Works across multiple monitors — the fish roams the whole desktop.
 
 ## Run from source
 

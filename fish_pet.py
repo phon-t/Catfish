@@ -1,9 +1,11 @@
-"""Floating transparent fish desktop pet (v3).
+"""Floating transparent fish desktop pet.
 - Loads giphy.webp, chroma-keys the blue background to transparent.
-- Body-locked swim animation (only the tail wiggles), head-first steering.
-- Layered light-wave wake + trailing bubbles + soft breathing halo.
-- Follow-mouse mode: press Ctrl+Shift+F anywhere to toggle (fish chases
-  your cursor; press again to go back to random wandering).
+- Body-locked swim animation (only the tail wiggles).
+- Heading-first swimming: the fish only moves where its head points,
+  turning in smooth arcs. Works across multiple monitors.
+- Faint dashed shimmer rings trail the tail while cruising.
+- Follow-mouse mode: Ctrl+Shift+F anywhere toggles it.
+- Quit from anywhere: Ctrl+Shift+Q (or right-click menu).
 - Scroll wheel / +/- adjusts size. Drag to move. Right-click for menu.
 Run: python fish_pet.py  (or double-click run_fish.bat)
 """
@@ -39,10 +41,21 @@ OUTER_TOL = 90
 TRANSPARENT_KEY = "black"
 DIRS = 16  # heading quantization steps for the render cache
 
-# Global hotkey: Ctrl+Shift+F toggles follow-mouse mode.
+# Global hotkeys: Ctrl+Shift+F toggles follow, Ctrl+Shift+Q quits.
 HOTKEY_MODS = 0x0002 | 0x0004  # MOD_CONTROL | MOD_SHIFT
 HOTKEY_VK = 0x46               # 'F'
+HOTKEY_QUIT_VK = 0x51          # 'Q'
 WM_HOTKEY = 0x0312
+
+
+def get_virtual_screen():
+    """Full desktop rect (x, y, w, h) spanning ALL monitors."""
+    try:
+        u = ctypes.windll.user32
+        return (u.GetSystemMetrics(76), u.GetSystemMetrics(77),
+                u.GetSystemMetrics(78), u.GetSystemMetrics(79))
+    except Exception:
+        return (0, 0, 1920, 1080)
 
 # Light-wave palette: bright core -> dim fading edge.
 WAVE_COLS = ["#f2feff", "#d3f8ff", "#a9eefa", "#7fdcf0",
@@ -62,13 +75,21 @@ class HotkeyThread(threading.Thread):
     def run(self):
         try:
             user32 = ctypes.windll.user32
-            if not user32.RegisterHotKey(None, 1, HOTKEY_MODS, HOTKEY_VK):
+            ok_f = user32.RegisterHotKey(None, 1, HOTKEY_MODS, HOTKEY_VK)
+            ok_q = user32.RegisterHotKey(None, 2, HOTKEY_MODS, HOTKEY_QUIT_VK)
+            if not ok_f or not ok_q:
                 self.q.put("hotkey_busy")
-                return
+                if not ok_f:
+                    user32.UnregisterHotKey(None, 2)
+                if not ok_q:
+                    user32.UnregisterHotKey(None, 1)
+                if not ok_f and not ok_q:
+                    return
             msg = wintypes.MSG()
             while user32.GetMessageA(ctypes.byref(msg), None, 0, 0) > 0:
                 if msg.message == WM_HOTKEY:
-                    self.q.put("toggle_follow")
+                    self.q.put("toggle_follow" if msg.wParam == 1
+                               else "quit_app")
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageA(ctypes.byref(msg))
         except Exception as e:  # non-Windows / restricted env
@@ -189,11 +210,18 @@ class FishPet:
         self.canvas.pack(fill="both", expand=True)
 
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        try:
+            self.vx0, self.vy0, self.vw, self.vh = get_virtual_screen()
+            if self.vw < sw:  # sanity: never smaller than primary screen
+                raise ValueError("bad virtual metrics")
+        except Exception:
+            self.vx0, self.vy0, self.vw, self.vh = 0, 0, sw, sh
         self.sw, self.sh = sw, sh
-        self.px = random.uniform(sw * 0.3, sw * 0.7)
-        self.py = random.uniform(sh * 0.3, sh * 0.7)
-        self.vx, self.vy = 1.5, 0.5
-        self.heading = math.atan2(self.vy, self.vx)
+        # start near the middle of the whole desktop (all monitors)
+        self.px = self.vx0 + random.uniform(self.vw * 0.35, self.vw * 0.65)
+        self.py = self.vy0 + random.uniform(self.vh * 0.35, self.vh * 0.65)
+        self.heading = random.uniform(-math.pi, math.pi)
+        self.spd = 1.5  # scalar forward speed; fish only moves along heading
         self.target = self.pick_target()
         self.rest_ticks = 0
         self.dragging = False
@@ -218,6 +246,7 @@ class FishPet:
         self.update_window_size()
         self.root.geometry(f"+{int(self.px)}+{int(self.py)}")
         self.poll_hotkey()
+        self.flash_text("Right-click me for options - drag me around", life=260)
         self.tick()
 
     # ---------------- setup ----------------
@@ -259,7 +288,7 @@ class FishPet:
         m.add_cascade(label="Swim speed", menu=sp)
         m.add_command(label="Toggle light waves", command=self.toggle_ripples)
         m.add_command(label="Pause / Resume (Space)", command=self.toggle_pause)
-        m.add_command(label="Quit (Q)", command=self.quit_app)
+        m.add_command(label="Quit (Ctrl+Shift+Q)", command=self.quit_app)
         self.menu = m
 
     def refresh_follow_label(self):
@@ -326,10 +355,12 @@ class FishPet:
                 msg = self.msg_q.get_nowait()
                 if msg == "toggle_follow":
                     self.toggle_follow()
+                elif msg == "quit_app":
+                    self.quit_app()
                 elif msg == "hotkey_busy":
                     self.hotkey_ok = False
-                    print("Note: Ctrl+Shift+F is already used by another app; "
-                          "use right-click menu or the F key instead.")
+                    print("Note: a global shortcut is already used by another "
+                          "app; use the right-click menu instead.")
                 elif isinstance(msg, tuple) and msg[0] == "hotkey_error":
                     self.hotkey_ok = False
                     print("Global hotkey unavailable:", msg[1])
@@ -340,6 +371,7 @@ class FishPet:
     def quit_app(self):
         try:
             ctypes.windll.user32.UnregisterHotKey(None, 1)
+            ctypes.windll.user32.UnregisterHotKey(None, 2)
         except Exception:
             pass
         self.root.destroy()
@@ -354,7 +386,7 @@ class FishPet:
     def on_drag_move(self, e):
         self.px = self.root.winfo_x() + e.x - self._dx
         self.py = self.root.winfo_y() + e.y - self._dy
-        self.vx, self.vy = 0.0, 0.0
+        self.spd = 0.0
         self.root.geometry(f"+{int(self.px)}+{int(self.py)}")
 
     def on_drag_end(self, e):
@@ -377,15 +409,20 @@ class FishPet:
         self.root.geometry(f"{w}x{w}")
 
     def pick_target(self):
-        margin = 90
+        # anywhere on the whole desktop, across all monitors
+        m = 120
+        x0, y0 = self.vx0 + m, self.vy0 + m
+        x1, y1 = self.vx0 + self.vw - m, self.vy0 + self.vh - m
+        if x1 <= x0 or y1 <= y0:
+            return (self.vx0 + self.vw / 2, self.vy0 + self.vh / 2)
         w = self.win_size()
         cx, cy = self.px + w / 2, self.py + w / 2
         for _ in range(12):
-            tx = random.uniform(margin, max(margin + 1, self.sw - margin))
-            ty = random.uniform(margin, max(margin + 1, self.sh - margin))
-            if math.hypot(tx - cx, ty - cy) >= 200:
+            tx = random.uniform(x0, x1)
+            ty = random.uniform(y0, y1)
+            if math.hypot(tx - cx, ty - cy) >= 220:
                 return (tx, ty)
-        return (self.sw / 2, self.sh / 2)
+        return (self.vx0 + self.vw / 2, self.vy0 + self.vh / 2)
 
     @staticmethod
     def _ang_diff(a, b):
@@ -393,6 +430,13 @@ class FishPet:
 
     def mouse_pos(self):
         return (self.root.winfo_pointerx(), self.root.winfo_pointery())
+
+    # ---------------- movement ----------------
+    # Heading-first model: the fish only ever advances along its heading,
+    # turning at a limited rate like a real fish. Sideways sliding is
+    # impossible by construction - the head always leads.
+    TURN_RATE = 0.11
+    ACCEL = 0.15
 
     def step_movement(self):
         if self.paused or self.dragging:
@@ -404,66 +448,79 @@ class FishPet:
             tx, ty = self.mouse_pos()
             dx, dy = tx - cx, ty - cy
             dist = math.hypot(dx, dy)
-            if dist < 1:
-                return 0.0
-            # chase the cursor, ease in close so it hovers nearby
-            speed_want = self.max_speed * 1.15 * min(1.0, dist / 220.0)
-            if dist < 42:
-                # gentle orbit so it doesn't sit dead still under the cursor
-                ox, oy = -dy / dist, dx / dist
-                dx, dy = dx * 0.3 + ox * dist * 0.7, dy * 0.3 + oy * dist * 0.7
-                dist = math.hypot(dx, dy) or 1
-                speed_want = self.max_speed * 0.35
-            dvx, dvy = dx / dist * speed_want, dy / dist * speed_want
+            if dist < 14:
+                # parked on the cursor: hold still, keep facing it
+                want_head = self.heading
+                want_spd = 0.0
+            else:
+                # always face the cursor, glide slower when close
+                want_head = math.atan2(dy, dx)
+                want_spd = self.max_speed * 1.15 * min(1.0, dist / 220.0)
+                if dist < 60:
+                    want_spd = max(0.5, want_spd * (dist / 60.0))
         else:
             if self.rest_ticks > 0:
                 self.rest_ticks -= 1
-                self.vx *= 0.94
-                self.vy *= 0.94
-                self.px += self.vx
-                self.py += self.vy
+                self.spd = max(0.0, self.spd - 0.18)
+                self.px += math.cos(self.heading) * self.spd
+                self.py += math.sin(self.heading) * self.spd
                 if self.rest_ticks == 0:
                     self.target = self.pick_target()
+                self._clamp_to_desktop(w)
                 self.root.geometry(f"+{int(self.px)}+{int(self.py)}")
-                return math.hypot(self.vx, self.vy)
+                return self.spd
             tx, ty = self.target
             dx, dy = tx - cx, ty - cy
             dist = math.hypot(dx, dy)
-            if dist < 30:
+            if dist < 34:
                 self.rest_ticks = random.randint(40, 130)
                 self.target = self.pick_target()
-                return math.hypot(self.vx, self.vy)
-            speed_want = self.max_speed * min(1.0, dist / 160.0)
-            speed_want = max(speed_want, 1.1)
-            dvx, dvy = dx / dist * speed_want, dy / dist * speed_want
+                return self.spd
+            want_head = math.atan2(dy, dx)
+            want_spd = self.max_speed * min(1.0, dist / 170.0)
+            want_spd = max(want_spd, 1.0)
 
-        margin = 130
-        if cx < margin:
-            dvx += (margin - cx) / margin * self.max_speed * 2
-        if cx > self.sw - margin:
-            dvx -= (cx - (self.sw - margin)) / margin * self.max_speed * 2
-        if cy < margin:
-            dvy += (margin - cy) / margin * self.max_speed * 2
-        if cy > self.sh - margin:
-            dvy -= (cy - (self.sh - margin)) / margin * self.max_speed * 2
+        # bend the wanted heading away from desktop edges (all monitors)
+        # before turning, so the body arcs instead of sliding
+        m = 150
+        push_x = push_y = 0.0
+        if cx < self.vx0 + m:
+            push_x += (self.vx0 + m - cx) / m
+        if cx > self.vx0 + self.vw - m:
+            push_x -= (cx - (self.vx0 + self.vw - m)) / m
+        if cy < self.vy0 + m:
+            push_y += (self.vy0 + m - cy) / m
+        if cy > self.vy0 + self.vh - m:
+            push_y -= (cy - (self.vy0 + self.vh - m)) / m
+        if push_x or push_y:
+            bx = math.cos(want_head) + push_x * 2.2
+            by = math.sin(want_head) + push_y * 2.2
+            want_head = math.atan2(by, bx)
 
-        max_force = 0.22
-        sx, sy = dvx - self.vx, dvy - self.vy
-        sm = math.hypot(sx, sy)
-        if sm > max_force:
-            sx, sy = sx / sm * max_force, sy / sm * max_force
-        self.vx += sx
-        self.vy += sy
+        # limited turn rate = smooth arcs; ease off in hard turns
+        diff = self._ang_diff(want_head, self.heading)
+        self.heading += max(-self.TURN_RATE, min(self.TURN_RATE, diff))
+        if abs(diff) > 0.7:
+            want_spd = min(want_spd, self.max_speed * 0.45)
+        if self.spd < want_spd:
+            self.spd = min(want_spd, self.spd + self.ACCEL)
+        else:
+            self.spd = max(want_spd, self.spd - self.ACCEL)
 
-        if math.hypot(self.vx, self.vy) > 0.3:
-            want = math.atan2(self.vy, self.vx)
-            turn = max(-0.09, min(0.09, self._ang_diff(want, self.heading)))
-            self.heading += turn
-
-        self.px += self.vx
-        self.py += self.vy
+        self.px += math.cos(self.heading) * self.spd
+        self.py += math.sin(self.heading) * self.spd
+        self._clamp_to_desktop(w)
         self.root.geometry(f"+{int(self.px)}+{int(self.py)}")
-        return math.hypot(self.vx, self.vy)
+        return self.spd
+
+    def _clamp_to_desktop(self, w):
+        # keep the fish centre on the desktop: free to visit every monitor,
+        # never lost off-screen
+        c = 40
+        self.px = min(max(self.px, self.vx0 + c - w / 2),
+                      self.vx0 + self.vw - c - w / 2)
+        self.py = min(max(self.py, self.vy0 + c - w / 2),
+                      self.vy0 + self.vh - c - w / 2)
 
     # ---------------- rendering ----------------
     @lru_cache(maxsize=128)
@@ -481,7 +538,7 @@ class FishPet:
         return int(round(self.heading / (2 * math.pi) * DIRS)) % DIRS
 
     def speed_now(self):
-        return math.hypot(self.vx, self.vy)
+        return self.spd
 
     def step_animation(self):
         self.anim_acc += max(0.25, self.speed_now() / self.max_speed)
@@ -502,24 +559,22 @@ class FishPet:
         return head, tail
 
     def spawn_wave(self, halo=False):
-        """One faint double-ring ripple around the tail. Kept subtle."""
+        """One thin dashed shimmer ring drifting off the tail."""
         _, (tx, ty) = self.head_tail_pos()
         ch, sh = abs(math.cos(self.heading)), abs(math.sin(self.heading))
         ex, ey = 0.7 + 0.6 * ch, 0.7 + 0.6 * sh  # stretch along swim axis
-        rings = []
-        for _ in range(2):
-            rid = self.canvas.create_oval(tx, ty, tx + 1, ty + 1,
-                                          outline=WAVE_COLS[2], width=1)
-            self.canvas.tag_lower(rid)
-            rings.append(rid)
+        rid = self.canvas.create_oval(tx, ty, tx + 1, ty + 1,
+                                      outline=WAVE_COLS[2], width=1,
+                                      dash=(6, 5))
+        self.canvas.tag_lower(rid)
         if halo:
-            max_r, life = self.size * 0.60, 110
+            max_r, life = self.size * 0.50, 120
         else:
-            max_r = self.size * (0.36 + random.random() * 0.14)
-            life = 40
+            max_r = self.size * (0.30 + random.random() * 0.10)
+            life = 44
         self.waves.append({"cx": tx, "cy": ty, "age": 0, "life": life,
                            "max_r": max_r, "ex": ex, "ey": ey,
-                           "rings": rings, "halo": halo,
+                           "rings": [rid], "halo": halo,
                            "col0": 3 if halo else 2})
         while len(self.waves) > 3:
             old = self.waves.pop(0)
@@ -608,12 +663,12 @@ class FishPet:
     def step_fx(self, spd):
         if not self.show_ripples or self.paused:
             return
-        # occasional faint ripple while cruising (rare at rest)
+        # occasional faint shimmer while cruising (rare at rest)
         self.ripple_timer += 1
-        interval = 30 if spd < 1.5 else (22 if spd < 2.5 else 16)
+        interval = 40 if spd < 1.5 else (30 if spd < 2.5 else 22)
         if self.ripple_timer >= interval:
             self.ripple_timer = 0
-            if spd >= 1.0 or random.random() < 0.12:
+            if spd >= 1.4 or random.random() < 0.06:
                 self.spawn_wave()
         # odd bubble only when swimming hard
         self.bubble_timer += 1
@@ -621,16 +676,16 @@ class FishPet:
             self.bubble_timer = 0
             if spd > 2.2 and random.random() < 0.35:
                 self.spawn_bubble()
-        # barely-there halo every ~5s at rest
+        # barely-there halo every ~7s at rest
         self.halo_timer += 1
-        if self.halo_timer >= 320:
+        if self.halo_timer >= 420:
             self.halo_timer = 0
             self.spawn_wave(halo=True)
         self.step_waves()
         self.step_bubbles()
 
     # ---------------- floating status text ----------------
-    def flash_text(self, text):
+    def flash_text(self, text, life=90):
         try:
             if self.flash:
                 self.canvas.delete(self.flash["id"])
@@ -640,13 +695,13 @@ class FishPet:
         fid = self.canvas.create_text(w / 2, w / 2 + self.size * 0.62,
                                       text=text, fill="#eafcff",
                                       font=("Segoe UI", 10, "bold"))
-        self.flash = {"id": fid, "age": 0}
+        self.flash = {"id": fid, "age": 0, "life": life}
 
     def step_flash(self):
         if not self.flash:
             return
         self.flash["age"] += 1
-        t = self.flash["age"] / 90.0
+        t = self.flash["age"] / float(self.flash.get("life", 90))
         if t >= 1.0:
             try:
                 self.canvas.delete(self.flash["id"])
@@ -691,8 +746,9 @@ class FishPet:
         self.root.after(16, self.tick)
 
     def run(self):
-        print("Fish pet running: Ctrl+Shift+F = follow mouse | drag = move | "
-              "wheel = size | right-click = menu | space = pause | q = quit")
+        print("Fish pet running: Ctrl+Shift+F = follow mouse | "
+              "Ctrl+Shift+Q = quit | drag = move | wheel = size | "
+              "right-click = menu | space = pause")
         self.root.mainloop()
 
 
