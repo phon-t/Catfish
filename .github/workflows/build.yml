@@ -18,7 +18,7 @@ jobs:
             name: windows
           - os: ubuntu-22.04
             name: linux
-          - os: macos-13
+          - os: macos-15-intel
             name: macos-x86_64
           - os: macos-14
             name: macos-arm64
