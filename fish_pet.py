@@ -21,7 +21,7 @@ from ctypes import wintypes
 from functools import lru_cache
 from tkinter import Menu
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -40,6 +40,10 @@ OUTER_TOL = 90
 
 TRANSPARENT_KEY = "black"
 DIRS = 16  # heading quantization steps for the render cache
+APP_VERSION = "1.2"
+IS_WINDOWS = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
+FONT = ("Segoe UI", 10, "bold") if IS_WINDOWS else ("Helvetica", 10, "bold")
 
 # Global hotkeys: Ctrl+Shift+F toggles follow, Ctrl+Shift+Q quits.
 HOTKEY_MODS = 0x0002 | 0x0004  # MOD_CONTROL | MOD_SHIFT
@@ -48,14 +52,69 @@ HOTKEY_QUIT_VK = 0x51          # 'Q'
 WM_HOTKEY = 0x0312
 
 
-def get_virtual_screen():
+def get_virtual_screen(root):
     """Full desktop rect (x, y, w, h) spanning ALL monitors."""
+    if IS_WINDOWS:
+        try:
+            u = ctypes.windll.user32
+            return (u.GetSystemMetrics(76), u.GetSystemMetrics(77),
+                    u.GetSystemMetrics(78), u.GetSystemMetrics(79))
+        except Exception:
+            pass
     try:
-        u = ctypes.windll.user32
-        return (u.GetSystemMetrics(76), u.GetSystemMetrics(77),
-                u.GetSystemMetrics(78), u.GetSystemMetrics(79))
+        x, y = root.winfo_vrootx(), root.winfo_vrooty()
+        w, h = root.winfo_vrootwidth(), root.winfo_vrootheight()
+        if w > 1 and h > 1:
+            return (x, y, w, h)
     except Exception:
-        return (0, 0, 1920, 1080)
+        pass
+    return (0, 0, root.winfo_screenwidth(), root.winfo_screenheight())
+
+
+class XShapeMasker:
+    """Per-pixel window transparency on Linux via the X11 SHAPE extension."""
+
+    def __init__(self, root):
+        self.ok = False
+        try:
+            self.x11 = ctypes.CDLL("libX11.so.6")
+            self.xext = ctypes.CDLL("libXext.so.6")
+            self.x11.XOpenDisplay.restype = ctypes.c_void_p
+            self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            self.dpy = self.x11.XOpenDisplay(None)
+            if not self.dpy:
+                return
+            self.win = ctypes.c_ulong(root.winfo_id())
+            self.x11.XCreateBitmapFromData.restype = ctypes.c_ulong
+            self.x11.XCreateBitmapFromData.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_char_p,
+                ctypes.c_uint, ctypes.c_uint]
+            self.x11.XFreePixmap.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            self.x11.XFlush.argtypes = [ctypes.c_void_p]
+            self.xext.XShapeCombineMask.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_ulong, ctypes.c_int]
+            # X bitmaps are LSB-first; PIL packs MSB-first
+            self.reverse = bytes(
+                int(f"{i:08b}"[::-1], 2) for i in range(256))
+            self.ok = True
+        except Exception:
+            self.ok = False
+
+    def apply(self, mask):
+        if not self.ok:
+            return
+        try:
+            w, h = mask.size
+            data = mask.tobytes().translate(self.reverse)
+            pm = self.x11.XCreateBitmapFromData(self.dpy, self.win, data, w, h)
+            if not pm:
+                return
+            self.xext.XShapeCombineMask(self.dpy, self.win, 0, 0, 0, pm, 0)
+            self.x11.XFreePixmap(self.dpy, pm)
+            self.x11.XFlush(self.dpy)
+        except Exception:
+            self.ok = False
 
 # Light-wave palette: bright core -> dim fading edge.
 WAVE_COLS = ["#f2feff", "#d3f8ff", "#a9eefa", "#7fdcf0",
@@ -118,18 +177,18 @@ def register_frames(frames):
     from PIL import ImageChops
     W, H = frames[0].size
     y0 = int(H * 0.55)  # head region: bottom 45%
+    bin_lut = [0] * 128 + [1] * 128
 
     def centroid(f):
-        a = f.crop((0, y0, W, H)).split()[3]
-        rw, rh = W, H - y0
-        total = sx = sy = 0
-        for i, v in enumerate(a.getdata()):
-            if v > 128:
-                total += 1
-                sx += i % rw
-                sy += i // rw
+        # column/row projections are computed in C - much faster than
+        # walking every pixel in Python
+        m = f.crop((0, y0, W, H)).split()[3].point(bin_lut)
+        cols, rows = m.getprojection()
+        total = sum(cols)
         if total == 0:
             return (W / 2, (H + y0) / 2)
+        sx = sum(i * c for i, c in enumerate(cols))
+        sy = sum(i * r for i, r in enumerate(rows))
         return (sx / total, sy / total + y0)
 
     ref_cx, ref_cy = centroid(frames[0])
@@ -141,8 +200,7 @@ def register_frames(frames):
         canvas.paste(f, (dx, dy), f)
         shifted.append(canvas)
         m = Image.new("L", (W, H), 0)
-        m.paste(f.split()[3].point(lambda a: 255 if a > 128 else 0),
-                (dx, dy))
+        m.paste(f.split()[3].point([0] * 128 + [255] * 128), (dx, dy))
         union = m if union is None else ImageChops.lighter(union, m)
 
     bx0, by0, bx1, by1 = union.getbbox()
@@ -152,7 +210,38 @@ def register_frames(frames):
     return [f.crop((x0, yt, x1, y1)) for f in shifted]
 
 
+CACHE_VERSION = "3"
+
+
+def frame_cache_path():
+    """Location for the processed-frame cache (per-user, writable)."""
+    base = (os.environ.get("LOCALAPPDATA")
+            or os.environ.get("TEMP") or BASE_DIR)
+    d = os.path.join(base, "CatfishPet")
+    try:
+        st = os.stat(SRC)
+        key = f"{CACHE_VERSION}_{st.st_size}_{int(st.st_mtime)}"
+    except Exception:
+        key = CACHE_VERSION
+    return d, os.path.join(d, f"frames_{key}.webp")
+
+
 def load_frames():
+    cache_dir, cache_file = frame_cache_path()
+
+    # fast path: reuse processed frames from a previous run
+    try:
+        if os.path.exists(cache_file):
+            im = Image.open(cache_file)
+            frames = []
+            for i in range(getattr(im, "n_frames", 1)):
+                im.seek(i)
+                frames.append(im.convert("RGBA"))
+            if frames:
+                return frames
+    except Exception:
+        pass
+
     im = Image.open(SRC)
     n = getattr(im, "n_frames", 1)
     raw = []
@@ -160,6 +249,14 @@ def load_frames():
         im.seek(i)
         raw.append(key_out_blue(im.copy()))
     frames = register_frames(raw)
+
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        frames[0].save(cache_file, save_all=True, append_images=frames[1:],
+                       lossless=True, quality=100, method=0)
+    except Exception:
+        pass
+
     if getattr(sys, "frozen", False):
         return frames  # running as exe: bundled art only, nothing to export
     try:
@@ -186,8 +283,24 @@ class FishPet:
         self.root.title("Fish Pet")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-transparentcolor", TRANSPARENT_KEY)
-        self.root.configure(bg=TRANSPARENT_KEY)
+
+        # per-pixel transparency differs per platform
+        if IS_WINDOWS:
+            self.root.attributes("-transparentcolor", TRANSPARENT_KEY)
+            self.root.configure(bg=TRANSPARENT_KEY)
+            bg = TRANSPARENT_KEY
+            self.shaper = None
+        elif IS_MAC:
+            bg = "systemTransparent"
+            try:
+                self.root.configure(bg=bg)
+                self.root.wm_attributes("-transparent", True)
+            except Exception:
+                bg = TRANSPARENT_KEY
+            self.shaper = None
+        else:
+            bg = TRANSPARENT_KEY  # hidden by the window shape mask
+            self.shaper = None
 
         self.frames = load_frames()
         self.n_frames = len(self.frames)
@@ -205,16 +318,13 @@ class FishPet:
         self.follow_mode = False
 
         self.ripple_pad = 56
-        self.canvas = tk.Canvas(self.root, bg=TRANSPARENT_KEY,
+        self.canvas = tk.Canvas(self.root, bg=bg,
                                 highlightthickness=0, bd=0)
         self.canvas.pack(fill="both", expand=True)
 
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        try:
-            self.vx0, self.vy0, self.vw, self.vh = get_virtual_screen()
-            if self.vw < sw:  # sanity: never smaller than primary screen
-                raise ValueError("bad virtual metrics")
-        except Exception:
+        self.vx0, self.vy0, self.vw, self.vh = get_virtual_screen(self.root)
+        if self.vw < sw or self.vh < sh:
             self.vx0, self.vy0, self.vw, self.vh = 0, 0, sw, sh
         self.sw, self.sh = sw, sh
         # start near the middle of the whole desktop (all monitors)
@@ -235,16 +345,28 @@ class FishPet:
         self.bubble_timer = 0
         self.halo_timer = 0
         self.img_id = None
+        self._photo = None
+        self._canvas_wh = None
+        self._img_wh = None
+        self._last_geom = None
+        self._shape_key = None
 
-        # global hotkey -> queue -> polled on the Tk thread
+        # global hotkey -> queue -> polled on the Tk thread (Windows only)
         self.msg_q = queue.Queue()
-        HotkeyThread(self.msg_q).start()
-        self.hotkey_ok = True
+        self.hotkey_ok = IS_WINDOWS
+        if IS_WINDOWS:
+            HotkeyThread(self.msg_q).start()
 
         self.bind_events()
         self.build_menu()
         self.update_window_size()
-        self.root.geometry(f"+{int(self.px)}+{int(self.py)}")
+        self._move_window()
+        self.root.update_idletasks()
+        if not (IS_WINDOWS or IS_MAC):
+            self.shaper = XShapeMasker(self.root)
+            # shaped Linux window shows only the fish silhouette, so the
+            # wake effects would be clipped away
+            self.show_ripples = False
         self.poll_hotkey()
         self.flash_text("Right-click me for options - drag me around", life=260)
         self.tick()
@@ -269,8 +391,9 @@ class FishPet:
         self.root.bind("F", lambda e: self.toggle_follow())
 
     def build_menu(self):
+        hot = "  (Ctrl+Shift+F)" if IS_WINDOWS else ""
         m = Menu(self.root, tearoff=0)
-        m.add_command(label="Follow mouse  (Ctrl+Shift+F)",
+        m.add_command(label=f"Follow mouse{hot}",
                       command=self.toggle_follow)
         self.follow_menu_idx = 0
         m.add_separator()
@@ -288,14 +411,18 @@ class FishPet:
         m.add_cascade(label="Swim speed", menu=sp)
         m.add_command(label="Toggle light waves", command=self.toggle_ripples)
         m.add_command(label="Pause / Resume (Space)", command=self.toggle_pause)
-        m.add_command(label="Quit (Ctrl+Shift+Q)", command=self.quit_app)
+        quit_label = "Quit (Ctrl+Shift+Q)" if IS_WINDOWS else "Quit"
+        m.add_command(label=quit_label, command=self.quit_app)
+        m.add_separator()
+        m.add_command(label=f"Catfish Pet v{APP_VERSION}", state="disabled")
         self.menu = m
 
     def refresh_follow_label(self):
         mark = "\u2713 " if self.follow_mode else ""
+        hot = "  (Ctrl+Shift+F)" if IS_WINDOWS else ""
         try:
             self.menu.entryconfig(self.follow_menu_idx,
-                                  label=f"{mark}Follow mouse  (Ctrl+Shift+F)")
+                                  label=f"{mark}Follow mouse{hot}")
         except Exception:
             pass
 
@@ -387,7 +514,7 @@ class FishPet:
         self.px = self.root.winfo_x() + e.x - self._dx
         self.py = self.root.winfo_y() + e.y - self._dy
         self.spd = 0.0
-        self.root.geometry(f"+{int(self.px)}+{int(self.py)}")
+        self._move_window()
 
     def on_drag_end(self, e):
         self.dragging = False
@@ -407,6 +534,13 @@ class FishPet:
     def update_window_size(self):
         w = self.win_size()
         self.root.geometry(f"{w}x{w}")
+
+    def _move_window(self):
+        """Only touch the window manager when the integer position changes."""
+        pos = (int(self.px), int(self.py))
+        if pos != self._last_geom:
+            self._last_geom = pos
+            self.root.geometry(f"+{pos[0]}+{pos[1]}")
 
     def pick_target(self):
         # anywhere on the whole desktop, across all monitors
@@ -467,7 +601,7 @@ class FishPet:
                 if self.rest_ticks == 0:
                     self.target = self.pick_target()
                 self._clamp_to_desktop(w)
-                self.root.geometry(f"+{int(self.px)}+{int(self.py)}")
+                self._move_window()
                 return self.spd
             tx, ty = self.target
             dx, dy = tx - cx, ty - cy
@@ -510,7 +644,7 @@ class FishPet:
         self.px += math.cos(self.heading) * self.spd
         self.py += math.sin(self.heading) * self.spd
         self._clamp_to_desktop(w)
-        self.root.geometry(f"+{int(self.px)}+{int(self.py)}")
+        self._move_window()
         return self.spd
 
     def _clamp_to_desktop(self, w):
@@ -524,15 +658,46 @@ class FishPet:
 
     # ---------------- rendering ----------------
     @lru_cache(maxsize=128)
-    def render_sprite(self, dir_idx, frame_idx, size):
-        frame = self.frames[frame_idx].resize((size, size), Image.LANCZOS)
-        side = int(self.rot_unit * size / self.sprite_unit)
+    def sprite_image(self, dir_idx, frame_idx, size):
+        """Rotated, aspect-correct frame (PIL) for a heading/frame/size."""
+        frame = self.frames[frame_idx]
+        fw, fh = frame.size
+        scale = size / self.sprite_unit
+        nw, nh = max(1, int(round(fw * scale))), max(1, int(round(fh * scale)))
+        frame = frame.resize((nw, nh), Image.LANCZOS)
+        side = max(1, int(round(self.rot_unit * scale)))
         canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
-        canvas.paste(frame, ((side - size) // 2, (side - size) // 2), frame)
+        canvas.paste(frame, ((side - nw) // 2, (side - nh) // 2), frame)
         heading = dir_idx * 2 * math.pi / DIRS
-        canvas = canvas.rotate(90.0 - math.degrees(heading),
-                               resample=Image.BICUBIC)
-        return ImageTk.PhotoImage(canvas)
+        return canvas.rotate(90.0 - math.degrees(heading),
+                             resample=Image.BICUBIC)
+
+    @lru_cache(maxsize=128)
+    def render_sprite(self, dir_idx, frame_idx, size):
+        return ImageTk.PhotoImage(self.sprite_image(dir_idx, frame_idx,
+                                                    size))
+
+    def update_shape(self, w):
+        """Apply the fish silhouette as the Linux window mask."""
+        if not self.shaper or not self.shaper.ok:
+            return
+        try:
+            sprite = self.sprite_image(self.dir_index(), self.frame_idx,
+                                       self.size)
+            alpha = sprite.split()[3].point([0] * 150 + [255] * 106)
+            side = sprite.size[0]
+            mask = Image.new("L", (w, w), 0)
+            mask.paste(alpha, ((w - side) // 2, (w - side) // 2))
+            if self.flash:
+                # keep the hint text readable: a small pill behind it
+                tw = min(w - 8, len(self.flash["text"]) * 6 + 18)
+                cy = w / 2 + self.size * 0.62
+                x0, y0 = (w - tw) / 2, cy - 11
+                ImageDraw.Draw(mask).rounded_rectangle(
+                    (x0, y0, x0 + tw, y0 + 22), radius=9, fill=255)
+            self.shaper.apply(mask.convert("1", dither=Image.NONE))
+        except Exception:
+            self.shaper.ok = False
 
     def dir_index(self):
         return int(round(self.heading / (2 * math.pi) * DIRS)) % DIRS
@@ -616,7 +781,9 @@ class FishPet:
                                        wv["cy"] - rr * wv["ey"],
                                        wv["cx"] + rr * wv["ex"],
                                        wv["cy"] + rr * wv["ey"])
-                    self.canvas.itemconfig(rid, outline=ci, width=1)
+                    if ci != wv.get("ci"):
+                        self.canvas.itemconfig(rid, outline=ci, width=1)
+                        wv["ci"] = ci
                 except Exception:
                     pass
 
@@ -627,6 +794,7 @@ class FishPet:
         r = random.uniform(1.5, 3.5)
         bid = self.canvas.create_oval(hx - r, hy - r, hx + r, hy + r,
                                       outline=BUBBLE_COL, width=1)
+        self.canvas.tag_lower(bid)
         self.bubbles.append({"x": hx, "y": hy,
                              "vx": random.uniform(-0.4, 0.4),
                              "vy": random.uniform(-1.4, -0.8),
@@ -694,8 +862,8 @@ class FishPet:
         w = self.win_size()
         fid = self.canvas.create_text(w / 2, w / 2 + self.size * 0.62,
                                       text=text, fill="#eafcff",
-                                      font=("Segoe UI", 10, "bold"))
-        self.flash = {"id": fid, "age": 0, "life": life}
+                                      font=FONT)
+        self.flash = {"id": fid, "age": 0, "life": life, "text": text}
 
     def step_flash(self):
         if not self.flash:
@@ -722,28 +890,40 @@ class FishPet:
     # ---------------- main loop ----------------
     def draw(self):
         w = self.win_size()
-        self.canvas.config(width=w, height=w)
+        if w != self._canvas_wh:
+            # resizing the canvas is expensive - only on size changes
+            self.canvas.config(width=w, height=w)
+            self._canvas_wh = w
         photo = self.render_sprite(self.dir_index(), self.frame_idx, self.size)
         if self.img_id is None:
             self.img_id = self.canvas.create_image(w / 2, w / 2, image=photo)
-        else:
+            self._img_wh = w
+        elif photo is not self._photo or w != self._img_wh:
+            # sprite swap + recenter only when they actually differ
             self.canvas.coords(self.img_id, w / 2, w / 2)
             self.canvas.itemconfig(self.img_id, image=photo)
-            self.canvas.tag_raise(self.img_id)
+            self._img_wh = w
         self._photo = photo
-        if self.flash:
-            try:
-                self.canvas.tag_raise(self.flash["id"])
-            except Exception:
-                pass
+        key = (self.dir_index(), self.frame_idx, self.size, w,
+               self.flash["id"] if self.flash else None)
+        if key != self._shape_key:
+            self._shape_key = key
+            self.update_shape(w)
 
     def tick(self):
         spd = self.step_movement()
         self.step_animation()
-        self.step_fx(spd if isinstance(spd, float) else self.speed_now())
+        self.step_fx(spd)
         self.step_flash()
         self.draw()
-        self.root.after(16, self.tick)
+        # adaptive frame rate: full speed while swimming, relaxed at rest
+        if self.paused:
+            delay = 60
+        elif spd > 0.25 or self.dragging:
+            delay = 16
+        else:
+            delay = 33
+        self.root.after(delay, self.tick)
 
     def run(self):
         print("Fish pet running: Ctrl+Shift+F = follow mouse | "

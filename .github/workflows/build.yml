@@ -1,0 +1,82 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows
+          - os: ubuntu-22.04
+            name: linux
+          - os: macos-13
+            name: macos-x86_64
+          - os: macos-14
+            name: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: pip install pillow pyinstaller
+
+      - name: Install Tk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk tk-dev
+
+      - name: Verify Tk
+        run: python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: pyinstaller --onefile --noconsole --name CatfishPet --add-data "giphy.webp;." --exclude-module numpy fish_pet.py
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --onefile --windowed --name CatfishPet --add-data "giphy.webp:." --exclude-module numpy fish_pet.py
+          /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" dist/CatfishPet.app/Contents/Info.plist
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: pyinstaller --onefile --name CatfishPet --add-data "giphy.webp:." --exclude-module numpy fish_pet.py
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p release
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp dist/CatfishPet.exe "release/CatfishPet-windows.exe"
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            ditto -c -k --sequesterRsrc --keepParent dist/CatfishPet.app "release/CatfishPet-${{ matrix.name }}.zip"
+          else
+            cp dist/CatfishPet "release/CatfishPet-linux"
+            chmod +x "release/CatfishPet-linux"
+          fi
+          ls -la release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CatfishPet-${{ matrix.name }}
+          path: release/*
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: release/*
+          generate_release_notes: true
